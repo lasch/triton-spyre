@@ -172,6 +172,61 @@ def gather_kernel_1core(
 
 
 @triton.jit
+def gather_one_tile(
+    in_ptr,
+    out_ptr,
+    idx_ptr,
+    y_offset,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K_INDICES: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    IN_LAYOUT: tl.constexpr,
+    OUT_LAYOUT: tl.constexpr,
+):
+    """``gather_kernel_1core`` plus guarded layout annotations.
+
+    No ``tl.program_id``, no loop -- every other gather kernel here carves
+    its index array across the grid with an ``scf.for``, and dbo-opt rejects
+    the loop that is outlined from it. This is the loop-free shape that
+    survives to the ``spyrecode`` stage, matching ``reduce_one_tile`` and
+    ``elementwise_1d_device`` in the sibling fixtures.
+
+    ``IN_LAYOUT``/``OUT_LAYOUT`` are guarded independently, so either
+    descriptor can be annotated alone.
+    """
+    idx_desc = tl.make_tensor_descriptor(
+        idx_ptr,
+        shape=[K_INDICES],
+        strides=[1],
+        block_shape=[K_INDICES],
+    )
+    idx = idx_desc.load([0])
+
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[1, BLOCK_COLS],
+    )
+    if IN_LAYOUT is not None:
+        tl.spyre_tensor_layout(in_desc, IN_LAYOUT)
+
+    result = in_desc.gather(idx, y_offset)
+
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[K_INDICES, BLOCK_COLS],
+        strides=[BLOCK_COLS, 1],
+        block_shape=[K_INDICES, BLOCK_COLS],
+    )
+    if OUT_LAYOUT is not None:
+        tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
+
+    out_desc.store([0, 0], result)
+
+
+@triton.jit
 def gather_kernel(
     in_ptr,
     out_ptr,
