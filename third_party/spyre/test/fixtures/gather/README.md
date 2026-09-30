@@ -41,10 +41,12 @@ Level A  shape/distribution   fp32 data, i32 indices (gather has one
 Level B  compute correctness   DTYPE sweep on gather_kernel_1core, the
                                 simplest legal shape (still no OP axis)
          1core_compute[DTYPE=fp16|fp32|i32]                    3 keys
+
+Level D  device                loop-free, single-tile, real OUT_LAYOUT
+         one_tile_device                        1 key (ktir_cpu only)
 ```
 
-Level D has no gather variant: no variant reaches a Spyre binary. The
-layout-carrying trio (`spyre_stick`, `spyre_stick_output_only`,
+The layout-carrying trio (`spyre_stick`, `spyre_stick_output_only`,
 `4d_spyre_stick_output`) sits outside Level A, deliberately
 unclassified — see the `Unclassified` section under `## Variants`
 below.
@@ -341,6 +343,53 @@ the full row, the simplest case. Because gather has no arithmetic —
 it is pure indexed data movement — all three dtypes are bit-exact
 against the NumPy oracle; unlike `reduce`/`elementwise`'s compute
 sweeps, no `rtol`/`atol` override is needed.
+
+### Level D — device
+
+| Variant            | M  | N   | K_INDICES | BLOCK_COLS | y_offset | IN_LAYOUT | OUT_LAYOUT   |
+|---------------------|----|-----|-----------|------------|----------|-----------|--------------|
+| `one_tile_device`  | 64 | 256 | 8         | 128        | 0        | `None`    | stick-on-N   |
+
+`gather_one_tile` is `gather_kernel_1core`'s shape — no `tl.program_id`, no
+loop, the whole index array in one `descriptor_gather` call — plus the same
+guarded-constexpr idiom `gather_kernel_spyre` uses for `IN_LAYOUT`/`OUT_LAYOUT`.
+Every other gather kernel here outlines an `scf.for` from its work
+distribution, and dbo-opt rejects that loop; removing it is what makes this
+variant reach the `spyrecode` stage at all, matching `reduce_one_tile` and
+`elementwise_1d_device` in the sibling fixtures.
+
+fp16 so the layout has more than one stick to select between: `N = 256` spans
+four source sticks (`128 // 2 = 64` elements per stick) and `BLOCK_COLS = 128`
+spans two output sticks, so `OUT_LAYOUT`'s `floordiv`/`mod` actually selects a
+stick rather than collapsing to stick 0.
+
+Unlike the layout-carrying trio above, this one *is* Level D rather than
+unclassified — it is the loop-free, single-tile shape, the one property that
+actually defines the band here — but `compiles_to_binary` is `False`: gather
+does not reach a binary either. The device-launch tier confirms it fails
+before dbo-opt is even invoked, on `RewriteDescriptorLayoutGeneric`:
+
+```
+this store's access tile is physicalized but its data is not on a
+physicalized chain, and this pass restates only linalg.generic; a
+one-sided annotation has no vehicle for the shape change, so annotate
+the source descriptor too, at a layout compatible with this one
+```
+
+`OUT_LAYOUT` alone physicalizes the store's access tile, but
+`descriptor_gather` is not a `linalg.generic`, so the pass has no vehicle to
+carry that shape change back through the gather to `in_desc`. `IN_LAYOUT`
+stays `None` rather than trading this for the other one-sided failure:
+annotating the rank-2 source alone leaves the store sink unannotated at
+logical rank 2 against a rank-3 physical source view, which `ktdp.store`
+rejects as a rank mismatch — the same failure `spyre_stick_output_only` above
+names for `gather_kernel_spyre` (inferred by analogy for this kernel, not
+independently reproduced). The diagnostic's own fix — annotate both
+descriptors at a mutually compatible layout — is untried: what "compatible"
+means for an indirect access tile is an open design question, not a params
+tweak. This is gather's own Level D obstacle, distinct from the `scf.for`
+refusal every other variant here shares, and it is why gather stays off
+`compile_stack.md`'s list of families that reach a device binary.
 
 ### Unclassified — layout-carrying (level deliberately unstated)
 
