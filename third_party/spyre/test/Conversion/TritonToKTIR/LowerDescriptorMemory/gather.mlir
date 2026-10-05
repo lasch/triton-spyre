@@ -408,9 +408,11 @@ tt.func @gather_captures_load_offset(%ptr: !tt.ptr<f16>, %idx_ptr: !tt.ptr<i32>,
 // Without that, its "ConvertDescriptorLoad invariant violated" assert would
 // fire on every compiled gather kernel.
 //
-// Note the signedness survives into the memref: the index view is
-// memref<32xsi32> and the indirect tile's second operand type matches, so the
-// bit-width compare is what reconciles them rather than a silent cast.
+// Note the signedness survives into the memref: an index buffer's view keeps
+// its descriptor's declared type for dataflow-scheduler's IAB, so it is
+// memref<32xsi32> and the indirect tile's second operand type matches, while
+// a data view would be made signless. The bit-width compare is what
+// reconciles the view with the signless x_offsets rather than a silent cast.
 
 // CHECK-LABEL:   tt.func @gather_signed_index_block(
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f16>, %[[VAL_1:.*]]: !tt.ptr<i32>, %[[VAL_2:.*]]: i32) -> tensor<32x64xf16> {
@@ -422,16 +424,16 @@ tt.func @gather_captures_load_offset(%ptr: !tt.ptr<f16>, %idx_ptr: !tt.ptr<i32>,
 // CHECK:           %[[VAL_8:.*]] = arith.constant 1 : i64
 // CHECK:           %[[VAL_9:.*]] = arith.constant 0 : i32
 // CHECK:           %[[VAL_10:.*]] = builtin.unrealized_conversion_cast %[[VAL_1]] : !tt.ptr<i32> to index
-// CHECK:           %[[VAL_11:.*]] = ktdp.construct_memory_view %[[VAL_10]], sizes: [32], strides: [1] {coordinate_set = #[[$ATTR_33]], memory_space = #ktdp.memory_space<global>} : memref<32xi32>
-// CHECK:           %[[VAL_12:.*]] = builtin.unrealized_conversion_cast %[[VAL_11]] : memref<32xi32> to !tt.tensordesc<32xsi32>
+// CHECK:           %[[VAL_11:.*]] = ktdp.construct_memory_view %[[VAL_10]], sizes: [32], strides: [1] {coordinate_set = #[[$ATTR_33]], memory_space = #ktdp.memory_space<global>} : memref<32xsi32>
+// CHECK:           %[[VAL_12:.*]] = builtin.unrealized_conversion_cast %[[VAL_11]] : memref<32xsi32> to !tt.tensordesc<32xsi32>
 // CHECK:           %[[VAL_13:.*]] = arith.index_cast %[[VAL_9]] : i32 to index
-// CHECK:           %[[VAL_14:.*]] = ktdp.construct_access_tile %[[VAL_11]]{{\[}}%[[VAL_13]]] {access_tile_order = #[[$ATTR_31]], access_tile_set = #[[$ATTR_33]]} : memref<32xi32> -> !ktdp.access_tile<32xindex>
+// CHECK:           %[[VAL_14:.*]] = ktdp.construct_access_tile %[[VAL_11]]{{\[}}%[[VAL_13]]] {access_tile_order = #[[$ATTR_31]], access_tile_set = #[[$ATTR_33]]} : memref<32xsi32> -> !ktdp.access_tile<32xindex>
 // CHECK:           %[[VAL_15:.*]] = ktdp.load %[[VAL_14]] : <32xindex> -> tensor<32xi32>
 // CHECK:           %[[VAL_16:.*]] = builtin.unrealized_conversion_cast %[[VAL_0]] : !tt.ptr<f16> to index
 // CHECK:           %[[VAL_17:.*]] = ktdp.construct_memory_view %[[VAL_16]], sizes: [1024, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_34]], memory_space = #ktdp.memory_space<global>} : memref<1024x128xf16>
 // CHECK:           %[[VAL_18:.*]] = builtin.unrealized_conversion_cast %[[VAL_17]] : memref<1024x128xf16> to !tt.tensordesc<1x64xf16>
 // CHECK:           %[[VAL_19:.*]] = arith.index_cast %[[VAL_2]] : i32 to index
-// CHECK:           %[[VAL_20:.*]] = ktdp.construct_indirect_access_tile intermediate_variables(%[[VAL_21:.*]], %[[VAL_22:.*]]) %[[VAL_17]][ind(%[[VAL_11]]{{\[}}%[[VAL_13]] + %[[VAL_21]]]), (%[[VAL_19]] + %[[VAL_22]])] {variables_space_order = #[[$ATTR_32]], variables_space_set = #[[$ATTR_35]]} : memref<1024x128xf16>, memref<32xi32> -> !ktdp.access_tile<32x64xindex>
+// CHECK:           %[[VAL_20:.*]] = ktdp.construct_indirect_access_tile intermediate_variables(%[[VAL_21:.*]], %[[VAL_22:.*]]) %[[VAL_17]][ind(%[[VAL_11]]{{\[}}%[[VAL_13]] + %[[VAL_21]]]), (%[[VAL_19]] + %[[VAL_22]])] {variables_space_order = #[[$ATTR_32]], variables_space_set = #[[$ATTR_35]]} : memref<1024x128xf16>, memref<32xsi32> -> !ktdp.access_tile<32x64xindex>
 // CHECK:           %[[VAL_23:.*]] = ktdp.load %[[VAL_20]] : <32x64xindex> -> tensor<32x64xf16>
 // CHECK:           tt.return %[[VAL_23]] : tensor<32x64xf16>
 // CHECK:         }

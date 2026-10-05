@@ -58,6 +58,15 @@ shape, since there's still no ``OP`` axis to cross it against):
     generalisations at once (2-D x_offsets AND a rank-3 source block),
     at paged-KV-cache shapes.
 
+One variant sits under a Level D banner (device: loop-free, single-tile):
+
+  - **one_tile_device** (``gather_one_tile``) — ``gather_kernel_1core``'s
+    shape plus guarded ``IN_LAYOUT``/``OUT_LAYOUT`` stick-on-N annotations
+    on both descriptors; the loop-free shape that lets ``reduce`` and
+    ``elementwise`` reach a binary. ``gather`` does not yet — see the banner
+    comment above it in ``VARIANTS`` for why both sides need annotating and
+    what still stops it in dbo-opt.
+
 One region sits outside the Level A banner, deliberately unclassified —
 see the banner comment above it in ``VARIANTS`` for why:
 
@@ -67,9 +76,7 @@ see the banner comment above it in ``VARIANTS`` for why:
     physicalizes (that moved from ``ktir`` to ``spyrecode``), so it would
     be misleading to call them Level C.
 
-Level D is a real gap here, not an omission — gather has no variant that
-reaches a Spyre binary. See ``fixtures/README.md`` for the field
-reference and discovery rules.
+See ``fixtures/README.md`` for the field reference and discovery rules.
 """
 
 import functools
@@ -194,6 +201,13 @@ def make_inputs_1core_compute(M, N, K_INDICES, BLOCK_COLS, y_offset,
     """Level B inputs: DTYPE-swept payload; idx_ptr stays i32 always."""
     return _make_inputs(M, N, K_INDICES, BLOCK_COLS, y_offset,
                         seed=2007, allow_duplicates=False, dtype=DTYPE)
+
+
+def make_inputs_one_tile_device(M, N, K_INDICES, BLOCK_COLS, y_offset,
+                                **_unused) -> dict:
+    """fp16 inputs for the loop-free device variant."""
+    return _make_inputs(M, N, K_INDICES, BLOCK_COLS, y_offset,
+                        seed=3001, allow_duplicates=False, dtype="fp16")
 
 
 def make_inputs_spyre(M, N, K_INDICES, BLOCK_COLS, y_offset,
@@ -758,6 +772,22 @@ _SIG_SPYRE = {
     "OUT_LAYOUT":  "constexpr",
 }
 _SS = functools.partial(sticksize, _SIG_SPYRE)
+
+# gather_one_tile: _SIG_1CORE plus the guarded layout constexprs, fp16 so a
+# stick layout has more than one stick to select between.
+_SIG_1CORE_SPYRE = {
+    "in_ptr":     "*fp16",
+    "out_ptr":    "*fp16",
+    "idx_ptr":    "*i32",
+    "y_offset":   "i32",
+    "M":          "i32",
+    "N":          "i32",
+    "K_INDICES":  "i32",
+    "BLOCK_COLS": "constexpr",
+    "IN_LAYOUT":  "constexpr",
+    "OUT_LAYOUT": "constexpr",
+}
+_SS1 = functools.partial(sticksize, _SIG_1CORE_SPYRE)
 
 # 2D kernel has no ``y_offset`` argument and adds ``BLOCK_ROWS``.
 _SIG_2D = {
@@ -1574,6 +1604,70 @@ VARIANTS = {
         },
         "reference": functools.partial(run_2d_index_3d_block, BLOCK_B=2, BLOCK_L=64, BLOCK_H=4),
         "inputs":    make_inputs_2d_index_3d_block_large,
+    },
+    # -----------------------------------------------------------------------
+    # Level D -- device
+    #
+    # gather_one_tile is gather_kernel_1core's shape (no tl.program_id, no
+    # loop) plus real IN_LAYOUT and OUT_LAYOUT annotations -- the loop-free,
+    # single-tile shape reduce and elementwise both reach a binary with. N
+    # spans four fp16 source sticks and BLOCK_COLS spans two output sticks,
+    # so each floordiv/mod actually selects a stick rather than collapsing
+    # to stick 0.
+    #
+    # An OUT_LAYOUT-only annotation used to fail here:
+    # RewriteDescriptorLayoutGeneric physicalizes the store's access tile but
+    # refuses to restate it unless the load feeding it is on a physicalized
+    # chain too, and with IN_LAYOUT left None it wasn't. The pass already
+    # carries a layout through a `construct_indirect_access_tile` (that is
+    # what `physicalizeIndirectAccessTile` is for -- see
+    # `RewriteDescriptorLayoutGeneric/subscripts-indirect.mlir`, which
+    # physicalizes this exact rank-2 indirect load/store shape) -- what was
+    # missing was not a mechanism, only the second annotation. in_ptr's
+    # [M, N] source gets the same stick-on-N treatment as out_ptr, at the
+    # same fp16 stick width, so both sides of the gather are on a
+    # physicalized chain and the pass's pre-flight check
+    # (`checkStoreDataIsRestatable`) is satisfied.
+    #
+    # In dbo-opt, the index buffer has to match the hardware Indirect Address
+    # Buffer: its view carries the IAB's signed entry type (`si32`, see
+    # LowerDescriptorMemory), and K_INDICES fills the IAB (32 entries on
+    # spyre_dd2_basic), because IndirectAddrBufLegalization has no window
+    # loop to split a smaller rank-1 IAB into. Past that, dbo-opt crashes in
+    # IndirectAddrBufLegalization's materializeEntryLoop, so the variant
+    # does not reach a binary yet.
+    # -----------------------------------------------------------------------
+    "one_tile_device": {
+        "base":       None,
+        "kernel_fn":  kernel.gather_one_tile,
+        "SIGNATURE":  _SIG_1CORE_SPYRE,
+        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS",
+                       "IN_LAYOUT", "OUT_LAYOUT"],
+        "params": {
+            "M":          [64],
+            "N":          [256],
+            # The hardware IAB size, not the verifier minimum of 8: see the
+            # banner above.
+            "K_INDICES":  [32],
+            "BLOCK_COLS": [128],
+            "y_offset":   [0],
+            # in_ptr [M, N]: stick-on-N -> [N//_SS1, M, _SS1]
+            "IN_LAYOUT":  [[(1, "floordiv", _SS1("in_ptr")), 0, (1, "mod", _SS1("in_ptr"))]],
+            # out_ptr [K_INDICES, BLOCK_COLS]: stick-on-N -> [BLOCK_COLS//_SS1, K_INDICES, _SS1]
+            "OUT_LAYOUT": [[(1, "floordiv", _SS1("out_ptr")), 0, (1, "mod", _SS1("out_ptr"))]],
+        },
+        "tags":       ["descriptor-gather", "spyre-tensor-layout"],
+        # No tl.program_id, so DistributeWork has nothing to place and the
+        # presence check would fail on a kernel that is correct.
+        "grid":       [1],
+        "reference":  run,
+        "inputs":     make_inputs_one_tile_device,
+        "output_key": "out_ptr",
+        "rtol":       1e-2,
+        "atol":       5e-2,
+        # False until dataflow-scheduler's materializeEntryLoop crash is
+        # fixed (see the banner above); flip it then.
+        "compiles_to_binary": False,
     },
     # -----------------------------------------------------------------------
     # Unclassified -- layout-carrying, level deliberately unstated

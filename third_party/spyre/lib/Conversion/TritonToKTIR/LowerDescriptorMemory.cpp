@@ -31,6 +31,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
 using namespace mlir;
@@ -115,9 +117,29 @@ struct ResolvedIndexView {
   SmallVector<Value> offsets; // one anchor per index-buffer dim
 };
 
+/// Resolve a gather/scatter `x_offsets` tensor, *before* lowering, to the
+/// `tt.make_tensor_descriptor` of the index buffer it was loaded from:
+///   tt.descriptor_load ← tt.make_tensor_descriptor
+/// Returns a null op when the chain is not present.
+///
+/// This is the same provenance rule `traceToSourceMemoryView` follows after
+/// lowering, stated over TTIR instead of KTDP: the pass needs it before walk 1
+/// has built the KTDP ops that function walks. The two must accept the same
+/// chains. A chain only the KTDP side accepts is caught by the gather/scatter
+/// patterns (see `checkIndexViewMarked`).
+static triton::MakeTensorDescOp traceIndexDescriptor(Value xOffsets) {
+  auto loadOp = xOffsets.getDefiningOp<triton::DescriptorLoadOp>();
+  if (!loadOp)
+    return nullptr;
+  return loadOp.getDesc().getDefiningOp<triton::MakeTensorDescOp>();
+}
+
 /// Try to resolve a tensor that was loaded via
 ///   ktdp.load ← construct_access_tile ← construct_memory_view
 /// to its source memory view and the descriptor_load anchor offset.
+///
+/// `traceIndexDescriptor` states the same rule over TTIR, for use before
+/// lowering; keep the two in step.
 ///
 /// When `tensor` is the SSA result of a `tt.descriptor_load` that has
 /// already been lowered to ktdp (which is the only legal provenance for
@@ -192,11 +214,10 @@ resolveIndexView(Value xOffsets) {
   // memref whose rank and element-storage-width match the descriptor's
   // block type, which is also the type of `xOffsets`.  An assert here
   // means the lowering pipeline is broken, not the user input. Element
-  // types are compared by bit width, not exact equality, as a defensive
-  // backstop: `buildBaseMemoryView` already reads the signless block
-  // type for this reason (a descriptor block type can be `si32` while
-  // `xOffsets` is signless `i32`), so this only matters if that ever
-  // regresses on some path.
+  // types are compared by bit width, not exact equality, because an
+  // index buffer's view keeps its descriptor's declared signedness (see
+  // walk 1): it is `si32` for an `*i32` index pointer while `xOffsets`
+  // is signless `i32`, and that is the normal case, not a regression.
   auto memrefType = cast<MemRefType>(resolved->view.getType());
   auto tensorType = cast<RankedTensorType>(xOffsets.getType());
   auto memInt = dyn_cast<IntegerType>(memrefType.getElementType());
@@ -445,9 +466,26 @@ struct ConvertDescriptorStore
   }
 };
 
+/// Fail, with a diagnostic on `op`, unless `indexView` is one walk 1 built
+/// for an index buffer the pre-walk found. A miss means `traceIndexDescriptor`
+/// and `traceToSourceMemoryView` disagree on a chain: the view would keep the
+/// signless type and reach dbo-opt, whose IAB requires the declared one.
+static LogicalResult
+checkIndexViewMarked(Operation *op, Value indexView,
+                     const llvm::DenseSet<Value> &indexViews) {
+  if (indexViews.contains(indexView))
+    return success();
+  return op->emitOpError(
+      "index buffer resolved after lowering was not identified as one "
+      "before it; traceIndexDescriptor and traceToSourceMemoryView must "
+      "accept the same x_offsets chains");
+}
+
 struct ConvertDescriptorGather
     : public OpConversionPattern<triton::DescriptorGatherOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertDescriptorGather(MLIRContext *ctx,
+                          const llvm::DenseSet<Value> &indexViews)
+      : OpConversionPattern(ctx), indexViews(indexViews) {}
 
   LogicalResult
   matchAndRewrite(triton::DescriptorGatherOp op, OpAdaptor adaptor,
@@ -459,6 +497,8 @@ struct ConvertDescriptorGather
     // the already-lowered descriptor_load, i.e. the ktdp.load result).
     auto indexRes = resolveIndexView(adaptor.getXOffsets());
     if (failed(indexRes))
+      return failure();
+    if (failed(checkIndexViewMarked(op, indexRes->view, indexViews)))
       return failure();
 
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
@@ -475,11 +515,16 @@ struct ConvertDescriptorGather
     rewriter.replaceOp(op, loadResult.getResult());
     return success();
   }
+
+private:
+  const llvm::DenseSet<Value> &indexViews;
 };
 
 struct ConvertDescriptorScatter
     : public OpConversionPattern<triton::DescriptorScatterOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertDescriptorScatter(MLIRContext *ctx,
+                           const llvm::DenseSet<Value> &indexViews)
+      : OpConversionPattern(ctx), indexViews(indexViews) {}
 
   LogicalResult
   matchAndRewrite(triton::DescriptorScatterOp op, OpAdaptor adaptor,
@@ -490,6 +535,8 @@ struct ConvertDescriptorScatter
     // Use adaptor to get the remapped x_offsets (post-conversion value).
     auto indexRes = resolveIndexView(adaptor.getXOffsets());
     if (failed(indexRes))
+      return failure();
+    if (failed(checkIndexViewMarked(op, indexRes->view, indexViews)))
       return failure();
 
     auto srcType = cast<RankedTensorType>(op.getSrc().getType());
@@ -503,11 +550,39 @@ struct ConvertDescriptorScatter
     rewriter.eraseOp(op);
     return success();
   }
+
+private:
+  const llvm::DenseSet<Value> &indexViews;
 };
 
 //===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
+
+/// True if `use` is the `x_offsets` operand of a gather or scatter.
+static bool isXOffsetsUse(OpOperand &use) {
+  Operation *owner = use.getOwner();
+  if (auto gather = dyn_cast<triton::DescriptorGatherOp>(owner))
+    return &use == &gather.getXOffsetsMutable();
+  if (auto scatter = dyn_cast<triton::DescriptorScatterOp>(owner))
+    return &use == &scatter.getXOffsetsMutable();
+  return false;
+}
+
+/// The first user of index descriptor `descOp` that is not an index use, or
+/// null. An index use is a `tt.descriptor_load` whose result feeds only
+/// gather/scatter `x_offsets`.
+static Operation *findNonIndexUser(triton::MakeTensorDescOp descOp) {
+  for (Operation *user : descOp.getResult().getUsers()) {
+    auto loadOp = dyn_cast<triton::DescriptorLoadOp>(user);
+    if (!loadOp)
+      return user;
+    for (OpOperand &use : loadOp.getResult().getUses())
+      if (!isXOffsetsUse(use))
+        return use.getOwner();
+  }
+  return nullptr;
+}
 
 struct LowerDescriptorMemoryPass
     : public mlir::triton::spyre::impl::LowerDescriptorMemoryBase<
@@ -537,6 +612,46 @@ struct LowerDescriptorMemoryPass
     // view of the underlying buffer.  The access-op patterns below
     // pick up that memref via `getDescriptorMemView` and lower into
     // ktdp.construct_access_tile + ktdp.load/store.
+    //
+    // A gather/scatter's index buffer is a descriptor like any other
+    // (`idx_desc.load([m])`), but dataflow-scheduler's
+    // `indirect-compute-group-split` requires the memref it reads indices
+    // from to carry the IAB's signed entry type (`si32`), not the signless
+    // type every other view gets below. Find those descriptors first, while
+    // the gathers and scatters that use them are still visible.
+    llvm::SmallPtrSet<Operation *, 4> indexBufferDescs;
+    module.walk([&](Operation *op) {
+      Value xOffsets;
+      if (auto gather = dyn_cast<triton::DescriptorGatherOp>(op))
+        xOffsets = gather.getXOffsets();
+      else if (auto scatter = dyn_cast<triton::DescriptorScatterOp>(op))
+        xOffsets = scatter.getXOffsets();
+      else
+        return;
+      if (auto idxDesc = traceIndexDescriptor(xOffsets))
+        indexBufferDescs.insert(idxDesc.getOperation());
+    });
+    // The signed view is the whole descriptor's, so an index buffer may not
+    // also be used as data: a store, or a load of values that go anywhere
+    // but `x_offsets`, would see `memref<...xsi32>` against a signless
+    // tensor, the mismatch the signless rule below exists to prevent.
+    for (Operation *op : indexBufferDescs) {
+      auto descOp = cast<triton::MakeTensorDescOp>(op);
+      if (Operation *user = findNonIndexUser(descOp)) {
+        InFlightDiagnostic diag = user->emitError(
+            "a descriptor used as a gather/scatter index buffer cannot also "
+            "be used as data: its memory view takes the IAB's signed element "
+            "type, which a data access through it would mismatch");
+        diag.attachNote(descOp.getLoc()) << "index buffer descriptor here";
+        signalPassFailure();
+        return;
+      }
+    }
+
+    // The views walk 1 builds for index buffers, for the gather/scatter
+    // patterns to confirm they resolve to one (`checkIndexViewMarked`).
+    llvm::DenseSet<Value> indexViews;
+
     OpBuilder builder(ctx);
     SmallVector<triton::MakeTensorDescOp> descOps;
     module.walk([&](triton::MakeTensorDescOp op) { descOps.push_back(op); });
@@ -559,12 +674,19 @@ struct LowerDescriptorMemoryPass
       // `tensor<...xi32>` — KTDP tolerates that split, but dbo-opt's
       // lowering of `ktdp.store` to `ktdf.data_transfer` does not, and
       // rejects the mismatched source/destination element types.
-      Type elemType =
-          cast<triton::TensorDescType>(descOp.getResult().getType())
-              .getSignlessBlockType()
-              .getElementType();
+      //
+      // The exception is an index buffer (`indexBufferDescs` above), which
+      // keeps the declared signedness of `getBlockType()` for the IAB. The
+      // check above guarantees nothing accesses it as data.
+      bool isIndexBuffer = indexBufferDescs.contains(descOp.getOperation());
+      auto descType = cast<triton::TensorDescType>(descOp.getResult().getType());
+      Type elemType = isIndexBuffer
+                          ? descType.getBlockType().getElementType()
+                          : descType.getSignlessBlockType().getElementType();
       Value memView =
           buildBaseMemoryView(builder, descOp.getLoc(), descOp, elemType);
+      if (isIndexBuffer)
+        indexViews.insert(memView);
       Value casted = UnrealizedConversionCastOp::create(
                          builder, descOp.getLoc(),
                          descOp.getResult().getType(), memView)
@@ -638,8 +760,9 @@ struct LowerDescriptorMemoryPass
                       mlir::triton::tts::TensorLayoutOp>();
 
     RewritePatternSet patterns(ctx);
-    patterns.add<ConvertDescriptorLoad, ConvertDescriptorStore,
-                 ConvertDescriptorGather, ConvertDescriptorScatter>(ctx);
+    patterns.add<ConvertDescriptorLoad, ConvertDescriptorStore>(ctx);
+    patterns.add<ConvertDescriptorGather, ConvertDescriptorScatter>(
+        ctx, indexViews);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
       module.emitError("LowerDescriptorMemory: failed to convert descriptor ops");
