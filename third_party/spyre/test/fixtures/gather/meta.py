@@ -1637,10 +1637,16 @@ VARIANTS = {
         "params": {
             "M":          [64],
             "N":          [256],
-            "K_INDICES":  [8],
+            # 32, not the verifier minimum of 8: dataflow-scheduler's
+            # IndirectAddrBufLegalization requires a loop-free IAB's
+            # innermost dimension to equal the hardware IAB size (32
+            # entries on spyre_dd2_basic), and this variant is deliberately
+            # loop-free (see the docstring above).
+            "K_INDICES":  [32],
             "BLOCK_COLS": [128],
             "y_offset":   [0],
-            "IN_LAYOUT":  [None],
+            # in_ptr [M, N]: stick-on-N -> [N//_SS1, M, _SS1]
+            "IN_LAYOUT":  [[(1, "floordiv", _SS1("in_ptr")), 0, (1, "mod", _SS1("in_ptr"))]],
             # out_ptr [K_INDICES, BLOCK_COLS]: stick-on-N -> [BLOCK_COLS//_SS1, K_INDICES, _SS1]
             "OUT_LAYOUT": [[(1, "floordiv", _SS1("out_ptr")), 0, (1, "mod", _SS1("out_ptr"))]],
         },
@@ -1653,7 +1659,7 @@ VARIANTS = {
         "output_key": "out_ptr",
         "rtol":       1e-2,
         "atol":       5e-2,
-        "compiles_to_binary": False,
+        "compiles_to_binary": True,
     },
     # -----------------------------------------------------------------------
     # Unclassified -- layout-carrying, level deliberately unstated
