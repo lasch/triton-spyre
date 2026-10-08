@@ -1645,10 +1645,18 @@ VARIANTS = {
             "K_INDICES":  [32],
             "BLOCK_COLS": [128],
             "y_offset":   [0],
-            # in_ptr [M, N]: stick-on-N -> [N//_SS1, M, _SS1]
-            "IN_LAYOUT":  [[(1, "floordiv", _SS1("in_ptr")), 0, (1, "mod", _SS1("in_ptr"))]],
-            # out_ptr [K_INDICES, BLOCK_COLS]: stick-on-N -> [BLOCK_COLS//_SS1, K_INDICES, _SS1]
-            "OUT_LAYOUT": [[(1, "floordiv", _SS1("out_ptr")), 0, (1, "mod", _SS1("out_ptr"))]],
+            # Both layouts are stick-on-N with the gathered dim kept outermost.
+            # dataflow-scheduler's IndirectAddrBufLegalization pins the first
+            # non-unit dim of the gather's output access tile, so the indirect
+            # dim has to lead out_ptr; with the stick dim leading instead, it
+            # pins that and fails expand_shape verification. in_ptr follows
+            # the same order, since RewriteDescriptorLayoutGeneric carries the
+            # gathered data in in_ptr's dim order and cannot permute it to
+            # match a differently ordered store.
+            # in_ptr [M, N] -> [M, N//_SS1, _SS1]
+            "IN_LAYOUT":  [[0, (1, "floordiv", _SS1("in_ptr")), (1, "mod", _SS1("in_ptr"))]],
+            # out_ptr [K_INDICES, BLOCK_COLS] -> [K_INDICES, BLOCK_COLS//_SS1, _SS1]
+            "OUT_LAYOUT": [[0, (1, "floordiv", _SS1("out_ptr")), (1, "mod", _SS1("out_ptr"))]],
         },
         "tags":       ["descriptor-gather", "spyre-tensor-layout"],
         # No tl.program_id, so DistributeWork has nothing to place and the
