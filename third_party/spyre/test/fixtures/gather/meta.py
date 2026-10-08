@@ -204,9 +204,16 @@ def make_inputs_1core_compute(M, N, K_INDICES, BLOCK_COLS, y_offset,
 
 def make_inputs_one_tile_device(M, N, K_INDICES, BLOCK_COLS, y_offset,
                                 **_unused) -> dict:
-    """fp16 inputs for the loop-free device variant."""
-    return _make_inputs(M, N, K_INDICES, BLOCK_COLS, y_offset,
-                        seed=3001, allow_duplicates=False, dtype="fp16")
+    """fp16 inputs for the loop-free device variant.
+
+    ``y_offset`` is a constexpr in ``gather_one_tile``, so it is not stashed
+    here: ``run_cpu`` would reject it as an unknown runtime kwarg. The
+    variant's oracle gets it bound with ``functools.partial`` instead.
+    """
+    inputs = _make_inputs(M, N, K_INDICES, BLOCK_COLS, y_offset,
+                          seed=3001, allow_duplicates=False, dtype="fp16")
+    del inputs["y_offset"]
+    return inputs
 
 
 def make_inputs_spyre(M, N, K_INDICES, BLOCK_COLS, y_offset,
@@ -231,7 +238,7 @@ def run_spyre(inputs: dict) -> np.ndarray:
     return in_data[idx, :]
 
 
-def run(inputs: dict) -> np.ndarray:
+def run(inputs: dict, y_offset: int | None = None) -> np.ndarray:
     """NumPy oracle: gather rows from ``in_ptr`` at ``idx_ptr`` positions.
 
     Mirrors the kernel exactly:
@@ -240,11 +247,14 @@ def run(inputs: dict) -> np.ndarray:
     ``y_offset`` and ``BLOCK_COLS`` come from ``inputs`` — ``y_offset``
     is stashed there by ``_make_inputs``, and ``BLOCK_COLS`` is
     recovered from the output buffer's column count. The oracle thus
-    works for every variant without per-variant plumbing.
+    works for every variant without per-variant plumbing. A variant
+    whose kernel takes ``y_offset`` as a constexpr can't stash it in
+    ``inputs`` and binds it here instead.
     """
     in_data = inputs["in_ptr"]
     idx = inputs["idx_ptr"]
-    y_offset = inputs["y_offset"]
+    if y_offset is None:
+        y_offset = inputs["y_offset"]
     block_cols = inputs["out_ptr"].shape[1]
     return in_data[idx, y_offset:y_offset + block_cols]
 
@@ -1632,7 +1642,7 @@ VARIANTS = {
         "base":       None,
         "kernel_fn":  kernel.gather_one_tile,
         "SIGNATURE":  _SIG_1CORE_SPYRE,
-        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS",
+        "constexpr":  ["y_offset", "M", "N", "K_INDICES", "BLOCK_COLS",
                        "IN_LAYOUT", "OUT_LAYOUT"],
         "params": {
             "M":          [64],
@@ -1662,7 +1672,8 @@ VARIANTS = {
         # No tl.program_id, so DistributeWork has nothing to place and the
         # presence check would fail on a kernel that is correct.
         "grid":       [1],
-        "reference":  run,
+        # Must match params["y_offset"]; see make_inputs_one_tile_device.
+        "reference":  functools.partial(run, y_offset=0),
         "inputs":     make_inputs_one_tile_device,
         "output_key": "out_ptr",
         "rtol":       1e-2,

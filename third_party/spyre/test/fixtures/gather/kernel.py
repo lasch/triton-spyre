@@ -176,7 +176,7 @@ def gather_one_tile(
     in_ptr,
     out_ptr,
     idx_ptr,
-    y_offset,
+    y_offset: tl.constexpr,
     M: tl.constexpr,
     N: tl.constexpr,
     K_INDICES: tl.constexpr,
@@ -194,6 +194,10 @@ def gather_one_tile(
 
     ``IN_LAYOUT``/``OUT_LAYOUT`` are guarded independently, so either
     descriptor can be annotated alone.
+
+    ``y_offset`` is a constexpr, unlike in ``gather_kernel_1core``: the
+    launcher passes only pointer arguments to the device, so a runtime
+    scalar would have no way to reach the kernel.
     """
     idx_desc = tl.make_tensor_descriptor(
         idx_ptr,
