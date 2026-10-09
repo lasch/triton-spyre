@@ -32,6 +32,9 @@
 // every operand of a generic must stick the same dims at the same width. The
 // pass refuses the generic, once per operand that does not, with a note at its
 // producer.
+//
+// Case 10 is not about fit between layouts: the layout annotates the index view
+// of a gather, which the pass does not physicalize.
 
 // Case 1 -- the layout does not fit the block.
 //
@@ -434,3 +437,34 @@ module {
   }
 }
 
+// -----
+
+// Case 10 -- the layout annotates the INDEX view of a gather, not its base.
+//
+// An indirect access tile uses a view in one of two roles: as its base, the data
+// gathered from, or as an index memref, read for the row positions. Only the base
+// role is physicalized. Without the decline, the tile would be rebuilt over the
+// physicalized index view as its BASE, with the index view's coordinate map
+// applied to the data subscripts, and the index operand would stay logical --
+// well-formed IR that gathers from the wrong buffer.
+//
+// Reachable from a kernel: tl.spyre_tensor_layout accepts any descriptor,
+// including the one a gather reads its indices through. The layout here is the
+// 1-D int32 generic stick layout, [ceil(N/32), 32].
+
+#idg = affine_map<(d0, d1) -> (d0, d1)>
+#sig = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+#sdg = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#stg = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+tt.func @annotated_index_view(%base: index, %idx: index, %c0: index) {
+  // expected-note @below {{annotated index view defined here}}
+  %iv = ktdp.construct_memory_view %idx, sizes: [64], strides: [1] {coordinate_set = #sig, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 32, 32>}} : memref<64xi32>
+  %mv = ktdp.construct_memory_view %base, sizes: [512, 128], strides: [128, 1] {coordinate_set = #sdg, memory_space = #ktdp.memory_space<global>} : memref<512x128xf32>
+  // expected-error @below {{tts.tensor_layout: an index memref of this indirect access tile carries a layout, and physicalizing an index view is not supported; only the tile's base may be annotated}}
+  %t = ktdp.construct_indirect_access_tile intermediate_variables(%m, %k) %mv[ind(%iv[%c0 + %m]), (%c0 + %k)] {variables_space_order = #idg, variables_space_set = #stg} : memref<512x128xf32>, memref<64xi32> -> !ktdp.access_tile<64x128xindex>
+  %l = ktdp.load %t : <64x128xindex> -> tensor<64x128xf32>
+  tt.return
+}
+}
