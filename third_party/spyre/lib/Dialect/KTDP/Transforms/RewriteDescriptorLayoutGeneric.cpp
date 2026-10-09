@@ -1528,6 +1528,23 @@ struct RewriteDescriptorLayoutGenericPass
                    dyn_cast<mlir::ktdp::ConstructIndirectAccessTilesOp>(user))
         indirectTiles.push_back(indirect);
 
+    // An indirect tile uses a view either as its base or as an index memref,
+    // and physicalizeIndirectAccessTile only knows the first: it would rebuild
+    // the tile over the index view as its base, leaving the index operand
+    // logical. Checked before this view is rebuilt.
+    for (auto tile : indirectTiles) {
+      if (!llvm::is_contained(tile.getIndirectMemrefs(),
+                              memViewOp.getResult()))
+        continue;
+      InFlightDiagnostic diag = tile.emitError(
+          "tts.tensor_layout: an index memref of this indirect access tile "
+          "carries a layout, and physicalizing an index view is not "
+          "supported; only the tile's base may be annotated");
+      diag.attachNote(memViewOp.getLoc())
+          << "annotated index view defined here";
+      return diag;
+    }
+
     auto physMemView = physicalizeMemView(memViewOp, *cm);
     if (failed(physMemView))
       return failure();
