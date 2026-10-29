@@ -99,8 +99,8 @@ static Value buildBaseMemoryView(OpBuilder &builder, Location loc,
 
 /// Resolved index view + descriptor_load anchor offsets for a
 /// gather/scatter `x_offsets` tensor.  `view` is the memref the indirect
-/// access tile reads from (e.g. `memref<N_ELEMENTS x si32>` at rank 1, or
-/// `memref<S0 x S1 x si32>` for a rank-2 index grid); `offsets` are the
+/// access tile reads from (e.g. `memref<N_ELEMENTS x i32>` at rank 1, or
+/// `memref<S0 x S1 x i32>` for a rank-2 index grid); `offsets` are the
 /// descriptor_load anchor offsets — i.e. the `[offset...]` arguments to
 /// `idx_desc.load([offset...])`, one per dim of the index buffer.
 /// Carrying the offsets out of the trace lets the gather lowering consume
