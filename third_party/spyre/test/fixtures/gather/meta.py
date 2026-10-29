@@ -62,9 +62,11 @@ One variant sits under a Level D banner (device: loop-free, single-tile):
 
   - **one_tile_device** (``gather_one_tile``) — ``gather_kernel_1core``'s
     shape plus guarded ``IN_LAYOUT``/``OUT_LAYOUT`` stick-on-N annotations
-    on both descriptors; the loop-free shape that lets ``reduce``,
-    ``elementwise`` and now ``gather`` reach a binary — see the banner
-    comment above it in ``VARIANTS`` for why both sides need annotating.
+    on both descriptors; the loop-free shape that lets ``reduce`` and
+    ``elementwise`` reach a binary. It compiles too, but is not marked
+    ``compiles_to_binary`` until the downstream fixes are in place — see the
+    banner comment above it in ``VARIANTS`` for why both sides need
+    annotating.
 
 One region sits outside the Level A banner, deliberately unclassified —
 see the banner comment above it in ``VARIANTS`` for why:
@@ -1619,10 +1621,10 @@ VARIANTS = {
     #
     # gather_one_tile is gather_kernel_1core's shape (no tl.program_id, no
     # loop) plus real IN_LAYOUT and OUT_LAYOUT annotations -- the loop-free,
-    # single-tile shape reduce and elementwise both reach a binary with. N
-    # spans four fp16 source sticks and BLOCK_COLS spans two output sticks,
-    # so each floordiv/mod actually selects a stick rather than collapsing
-    # to stick 0.
+    # single-tile shape reduce and elementwise both reach a binary with.
+    # BLOCK_COLS == N: each gathered row is read whole, four fp16 sticks on
+    # both the source and the output side, so each floordiv/mod actually
+    # selects a stick rather than collapsing to stick 0.
     #
     # An OUT_LAYOUT-only annotation used to fail here:
     # RewriteDescriptorLayoutGeneric physicalizes the store's access tile but
@@ -1653,7 +1655,7 @@ VARIANTS = {
             # entries on spyre_dd2_basic), and this variant is deliberately
             # loop-free (see the docstring above).
             "K_INDICES":  [32],
-            "BLOCK_COLS": [128],
+            "BLOCK_COLS": [256],
             "y_offset":   [0],
             # Both layouts are stick-on-N with the gathered dim kept outermost.
             # dataflow-scheduler's IndirectAddrBufLegalization pins the first
@@ -1678,7 +1680,10 @@ VARIANTS = {
         "output_key": "out_ptr",
         "rtol":       1e-2,
         "atol":       5e-2,
-        "compiles_to_binary": True,
+        # Temporarily False until downstream fixes are in place: the variant
+        # compiles to a binary, but on the device the program either never
+        # completes or returns wrong rows.
+        "compiles_to_binary": False,
     },
     # -----------------------------------------------------------------------
     # Unclassified -- layout-carrying, level deliberately unstated

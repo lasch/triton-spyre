@@ -348,7 +348,7 @@ sweeps, no `rtol`/`atol` override is needed.
 
 | Variant            | M  | N   | K_INDICES | BLOCK_COLS | y_offset | IN_LAYOUT | OUT_LAYOUT   |
 |---------------------|----|-----|-----------|------------|----------|-----------|--------------|
-| `one_tile_device`  | 64 | 256 | 8         | 128        | 0        | `None`    | stick-on-N   |
+| `one_tile_device`  | 64 | 256 | 32        | 256        | 0        | stick-on-N | stick-on-N  |
 
 `gather_one_tile` is `gather_kernel_1core`'s shape — no `tl.program_id`, no
 loop, the whole index array in one `descriptor_gather` call — plus the same
@@ -359,37 +359,21 @@ variant reach the `spyrecode` stage at all, matching `reduce_one_tile` and
 `elementwise_1d_device` in the sibling fixtures.
 
 fp16 so the layout has more than one stick to select between: `N = 256` spans
-four source sticks (`128 // 2 = 64` elements per stick) and `BLOCK_COLS = 128`
-spans two output sticks, so `OUT_LAYOUT`'s `floordiv`/`mod` actually selects a
-stick rather than collapsing to stick 0.
+four source sticks (`128 // 2 = 64` elements per stick) and `BLOCK_COLS = 256`
+(`== N`, `y_offset = 0`) reads each gathered row whole, so the output spans the
+same four sticks and the layouts' `floordiv`/`mod` actually select a stick
+rather than collapsing to stick 0. `K_INDICES = 32` is the hardware IAB size:
+dataflow-scheduler requires a loop-free IAB's innermost dimension to equal it.
 
 Unlike the layout-carrying trio above, this one *is* Level D rather than
 unclassified — it is the loop-free, single-tile shape, the one property that
-actually defines the band here — but `compiles_to_binary` is `False`: gather
-does not reach a binary either. The device-launch tier confirms it fails
-before dbo-opt is even invoked, on `RewriteDescriptorLayoutGeneric`:
-
-```
-this store's access tile is physicalized but its data is not on a
-physicalized chain, and this pass restates only linalg.generic; a
-one-sided annotation has no vehicle for the shape change, so annotate
-the source descriptor too, at a layout compatible with this one
-```
-
-`OUT_LAYOUT` alone physicalizes the store's access tile, but
-`descriptor_gather` is not a `linalg.generic`, so the pass has no vehicle to
-carry that shape change back through the gather to `in_desc`. `IN_LAYOUT`
-stays `None` rather than trading this for the other one-sided failure:
-annotating the rank-2 source alone leaves the store sink unannotated at
-logical rank 2 against a rank-3 physical source view, which `ktdp.store`
-rejects as a rank mismatch — the same failure `spyre_stick_output_only` above
-names for `gather_kernel_spyre` (inferred by analogy for this kernel, not
-independently reproduced). The diagnostic's own fix — annotate both
-descriptors at a mutually compatible layout — is untried: what "compatible"
-means for an indirect access tile is an open design question, not a params
-tweak. This is gather's own Level D obstacle, distinct from the `scf.for`
-refusal every other variant here shares, and it is why gather stays off
-`compile_stack.md`'s list of families that reach a device binary.
+actually defines the band here. Both descriptors carry the stick-on-N layout, so
+it compiles through `dbo-opt` to a `spyrecode` binary; `compiles_to_binary` is
+nevertheless `False`, temporarily, until downstream fixes are in place. On the
+device the program either never completes or returns wrong rows, and
+`test_device_launch.py` and the `spyrecode` lit tests would otherwise pick the
+variant up. Remove the `False` (or set it to `True`) once the gather runs
+correctly on the device.
 
 ### Unclassified — layout-carrying (level deliberately unstated)
 
