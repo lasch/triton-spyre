@@ -61,9 +61,11 @@
 //   names — STICK for the first, LANE for the second — because that is what they
 //   are on the device. W is a basis element.
 //
-//   The COMPOSITE an operand holding the dim whole has to carry is the inverse:
-//   the LINEARIZATION `stick * W + lane` over the same basis, which is what
-//   `affine.linearize_index` computes. See linearizeStickLane.
+//   An operand that holds a split dim WHOLE would have to be restated with the
+//   inverse, the LINEARIZATION `stick * W + lane` over the same basis. The
+//   rewrite does not emit that map: refuseLinearization rejects the generic
+//   instead, so every operand that reads a split dim must split it too, and every
+//   rebuilt map result is a bare loop dim or a constant.
 //
 //===----------------------------------------------------------------------===//
 
@@ -275,15 +277,40 @@ struct CoordMap {
   unsigned physRank() const { return src.size(); }
   CoordOp opAt(unsigned p) const { return static_cast<CoordOp>(op[p]); }
 
-  /// Does this layout delinearize logical dim `d` into a (stick, lane) pair?
-  ///
-  /// A splat names `d` too, but it partitions nothing — it replicates `d`
-  /// across a fresh axis — so it is not a delinearization and the dim stays
-  /// whole. Asking for the floordiv half is therefore the question, not "is some
-  /// dim of `d` non-identity".
-  bool splits(int64_t d) const {
-    return findPhys(d, CoordOp::FloorDiv) >= 0;
+  /// The stick dim: the last physical dim, when it is a mod or a splat entry.
+  /// verifyTensorLayoutArrays admits at most one stick dim, and only there.
+  std::optional<unsigned> stickPhys() const {
+    unsigned last = physRank() - 1;
+    CoordOp c = opAt(last);
+    if (c == CoordOp::Mod || c == CoordOp::Splat)
+      return last;
+    return std::nullopt;
   }
+
+  /// The logical dim this layout delinearizes into a (stick, lane) pair, if
+  /// any: the source of the stick dim when it is a mod. A splat stick dim
+  /// partitions nothing — it replicates its dim across a fresh axis — so it
+  /// delinearizes no dim.
+  std::optional<int64_t> splitDim() const {
+    auto p = stickPhys();
+    if (!p || opAt(*p) != CoordOp::Mod)
+      return std::nullopt;
+    return src[*p];
+  }
+
+  /// The stick dim when it is a splat entry: the one physical dim a splat can
+  /// occupy.
+  std::optional<unsigned> splatPhys() const {
+    auto p = stickPhys();
+    if (!p || opAt(*p) != CoordOp::Splat)
+      return std::nullopt;
+    return p;
+  }
+
+  /// The stick width the split dim is delinearized over — the second element of
+  /// the basis (ceildiv(extent, W), W), read off the mod dim. Only meaningful
+  /// when splitDim() has a value; the floordiv's divisor is the same width.
+  int64_t stickWidth() const { return arg[*stickPhys()]; }
 
   /// Is logical dim `d` named by any physical dim at all? Every dim must be,
   /// or the layout drops it — see readCoordMap.
@@ -295,14 +322,6 @@ struct CoordMap {
       if (src[p] == d && opAt(p) == wanted)
         return p;
     return -1;
-  }
-
-  /// The stick width logical dim `d` is delinearized over — the second element
-  /// of the basis (ceildiv(extent, W), W). Only meaningful when `splits(d)`;
-  /// read off the mod dim, which is where the width is the extent.
-  int64_t stickWidth(int64_t d) const {
-    int p = findPhys(d, CoordOp::Mod);
-    return p < 0 ? 0 : arg[p];
   }
 };
 
@@ -426,25 +445,23 @@ readCoordMap(ArrayRef<int64_t> physSrc, ArrayRef<int64_t> physOp,
 /// what `affine.linearize_index` computes over that basis, and the exact inverse
 /// of the `affine.delinearize_index` the split states.
 ///
-/// This is the *only* arithmetic either carrier introduces, and both introduce
-/// the same one. rewriteAdjacentGenerics names the two components after dims of
-/// the rebuilt iteration space; the indirect access tile names them after
-/// intermediate variables of its own variable space. Different numbering,
-/// identical algebra — so the algebra lives here once and each carrier passes in
-/// the exprs it numbers the components with.
+/// The indirect access tile is the one caller: it names the two components
+/// after intermediate variables of its own variable space and recovers each
+/// logical subscript from them. A linalg operand map never carries it; see
+/// refuseLinearization.
 inline AffineExpr linearizeStickLane(AffineExpr stick, int64_t width,
                                      AffineExpr lane) {
   return stick * width + lane;
 }
 
-/// `stickBlock`, a physical block spanning every splat dim's whole stick, cut
-/// to lane 0 of each splat dim. Every other dim is unchanged.
+/// `stickBlock`, a physical block spanning the splat dim's whole stick, cut to
+/// lane 0 of that dim. Every other dim is unchanged, and so is a block under a
+/// layout with no splat dim.
 SmallVector<int64_t> lane0Block(const CoordMap &cm,
                                 ArrayRef<int64_t> stickBlock) {
   SmallVector<int64_t> out(stickBlock);
-  for (unsigned p = 0, e = cm.physRank(); p < e; ++p)
-    if (cm.opAt(p) == CoordOp::Splat)
-      out[p] = 1;
+  if (std::optional<unsigned> p = cm.splatPhys())
+    out[*p] = 1;
   return out;
 }
 
@@ -465,19 +482,19 @@ FailureOr<RankedTensorType> physicalTensorType(const CoordMap &cm,
 /// How a generic operand touches a physicalized view. The two differ only on a
 /// splat physical dim.
 enum class Access {
-  /// An `outs` operand whose result is stored: every lane of a splat dim, each
+  /// An `outs` operand whose result is stored: every lane of the splat dim,
   /// named by a loop of its own.
   Write,
-  /// An `ins` operand loaded from a view: the rebuilt map names each splat dim
+  /// An `ins` operand loaded from a view: the rebuilt map names the splat dim
   /// at lane 0.
   Read,
 };
 
 /// Which physical tile a load from a physicalized view is rebuilt over.
 enum class LoadTile {
-  /// The whole stick on every splat dim, as a store's tile is.
+  /// The whole stick on the splat dim, as a store's tile is.
   Stick,
-  /// Lane 0 of each splat dim: a load from a splat layout whose every use is an
+  /// Lane 0 of the splat dim: a load from a splat layout whose every use is an
   /// Access::Read operand, so one lane is all its readers name.
   Lane0,
 };
@@ -489,11 +506,11 @@ struct RebuildOperand {
   AffineMap logicalMap;
   const CoordMap *layout = nullptr;
   Access access = Access::Read;
-  /// Loop dim assigned to each of this operand's SPLAT physical dims, keyed
-  /// by physical dim; -1 for every dim that is not a splat, and empty for a
-  /// read. Filled by buildLoopDomain, because a written splat axis is the
-  /// one physical dim that no logical loop dim accounts for — see LoopDomain.
-  SmallVector<int> splatDim;
+  /// Loop dim assigned to this operand's SPLAT physical dim, which is always
+  /// its last; -1 when it has none, and for a read. Filled by buildLoopDomain,
+  /// because a written splat axis is the one physical dim that no logical loop
+  /// dim accounts for — see LoopDomain.
+  int splatLoop = -1;
 };
 
 /// One piece of the refined iteration space: a logical dim's stick index, its
@@ -536,19 +553,17 @@ struct DomainPiece {
 /// rebuilt generic's iteration space has more dims than the logical one did, and
 /// the components only mean anything if every operand names the same rebuilt loop
 /// dim for the same component. stickDim[d] and laneDim[d] are that agreement, one
-/// entry per LOGICAL dim; width[d] is the basis element an operand holding d
-/// whole needs to linearize the two components back into the one index it
-/// addresses d with (linearizeStickLane).
+/// entry per LOGICAL dim; width[d] is the basis element it was delinearized over.
 ///
-/// A logical dim is delinearized here if ANY operand delinearizes it, not only
-/// if all do — which is why a carrier that does not needs the linearization at
-/// all, and why width is part of the domain rather than of the operand that
-/// delinearized the dim.
+/// A logical dim is delinearized here if ANY operand delinearizes it.
+/// refuseLinearization then requires every other operand that reads it to
+/// delinearize it too; splitBy[d] records the first operand that did, for that
+/// diagnostic.
 ///
 /// Splat physical dims are not in this numbering: a splat is an axis no logical
-/// loop dim accounts for, so a write gets its own loop dim per splat dim,
-/// allocated after the pieces are ordered and recorded in
-/// RebuildOperand::splatDim. A read names it with the constant 0 and gets none.
+/// loop dim accounts for, so a write with one gets its own loop dim, allocated
+/// after the pieces are ordered and recorded in RebuildOperand::splatLoop. A
+/// read names it with the constant 0 and gets none.
 struct LoopDomain {
   /// Loop dim carrying logical dim d's stick index, or its whole extent when
   /// the dim is unsplit.
@@ -560,6 +575,8 @@ struct LoopDomain {
   /// when the dim is not delinearized. Taken from the operands, which must agree
   /// — see buildLoopDomain.
   SmallVector<int64_t> width;
+  /// The first operand that delinearizes logical dim d; -1 when none does.
+  SmallVector<int> splitBy;
   unsigned numLoopDims = 0;
 
   bool isSplit(int64_t d) const { return laneDim[d] >= 0; }
@@ -572,6 +589,9 @@ struct LoopDomain {
 /// none of its own — so the two dims it skips are what a reader has to be able to
 /// rule out. Both skips are safe, and each says why below; readCoordMap's
 /// completeness check is what makes the first one safe.
+///
+/// A layout has at most one stick dim and it is the last physical dim, so the
+/// walk emits at most one lane piece, and only as its last piece.
 void collectPieces(const RebuildOperand &o,
                    SmallVectorImpl<DomainPiece> &pieces) {
   unsigned numDims =
@@ -595,6 +615,8 @@ void collectPieces(const RebuildOperand &o,
       // dim by some other operand — or the generic was non-invertible and never
       // reached this pass. See buildLoopDomain.
       continue;
+    assert((coordOp != CoordOp::Mod || p + 1 == numDims) &&
+           "a lane piece comes only from the last physical dim");
     pieces.push_back({dimExpr.getPosition(), coordOp == CoordOp::Mod});
   }
 }
@@ -608,7 +630,7 @@ void collectPieces(const RebuildOperand &o,
 /// WHICH dims are delinearized, and over what basis — read off the operands'
 /// layouts. Any one operand delinearizing a dim delinearizes it for the whole
 /// domain; two operands doing it at different stick widths is the one way this
-/// fails, since no single linearization would address the dim.
+/// fails, since the domain gives the dim one (stick, lane) pair of loop dims.
 ///
 /// WHAT ORDER the resulting pieces are numbered in, which is the part that has a
 /// constraint on it. The result operand's map has to take the loop dims in the
@@ -624,9 +646,9 @@ void collectPieces(const RebuildOperand &o,
 /// There is no third step: between them those two name every piece, for the
 /// reasons set out at the assertion below.
 ///
-/// Splat physical dims are outside all of this: they name no piece, so each one
-/// a write carries gets a fresh loop dim appended after the ordering is fixed.
-/// A read's splat dims get none.
+/// Splat physical dims are outside all of this: they name no piece, so a write's
+/// splat — at most one, its last physical dim — gets a fresh loop dim appended
+/// after the ordering is fixed. A read's splat gets none.
 FailureOr<LoopDomain>
 buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
                 unsigned logicalNumLoops,
@@ -635,26 +657,29 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
   dom.stickDim.assign(logicalNumLoops, -1);
   dom.laneDim.assign(logicalNumLoops, -1);
   dom.width.assign(logicalNumLoops, 0);
+  dom.splitBy.assign(logicalNumLoops, -1);
 
-  // Which logical loop dims are split, and at what width.
-  for (const RebuildOperand &o : operands) {
+  // Which logical loop dims are split, and at what width: at most one per
+  // operand, the logical dim its stick dim delinearizes.
+  for (auto [i, o] : llvm::enumerate(operands)) {
     if (!o.layout)
       continue;
-    for (unsigned r = 0, e = o.logicalMap.getNumResults(); r < e; ++r) {
-      auto dimExpr = dyn_cast<AffineDimExpr>(o.logicalMap.getResult(r));
-      if (!dimExpr)
-        continue; // a constant (a folded splat) names no loop dim
-      unsigned loop = dimExpr.getPosition();
-      if (!o.layout->splits(r))
-        continue;
-      int64_t w = o.layout->stickWidth(r);
-      if (dom.width[loop] && dom.width[loop] != w)
-        return emitError() << "loop dim " << loop
-                           << " is split at two different stick widths ("
-                           << dom.width[loop] << " and " << w
-                           << "), so no single composite addresses it";
-      dom.width[loop] = w;
-    }
+    std::optional<int64_t> r = o.layout->splitDim();
+    if (!r)
+      continue;
+    auto dimExpr = dyn_cast<AffineDimExpr>(o.logicalMap.getResult(*r));
+    if (!dimExpr)
+      continue; // a constant (a folded splat) names no loop dim
+    unsigned loop = dimExpr.getPosition();
+    int64_t w = o.layout->stickWidth();
+    if (dom.width[loop] && dom.width[loop] != w)
+      return emitError() << "loop dim " << loop
+                         << " is split at two different stick widths ("
+                         << dom.width[loop] << " and " << w
+                         << "), so no single composite addresses it";
+    dom.width[loop] = w;
+    if (dom.splitBy[loop] < 0)
+      dom.splitBy[loop] = i;
   }
 
   // Step 1: the result's physical order seeds the numbering. The result is the
@@ -729,14 +754,12 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
     (pc.lane ? dom.laneDim : dom.stickDim)[pc.loop] = n;
   dom.numLoopDims = order.size();
 
-  // One loop per splat physical dim of a write, after the refinement.
+  // One loop per write whose stick dim is a splat, after the refinement.
   for (RebuildOperand &o : operands) {
     if (!o.layout || o.access == Access::Read)
       continue;
-    o.splatDim.assign(o.layout->physRank(), -1);
-    for (unsigned p = 0, e = o.layout->physRank(); p < e; ++p)
-      if (o.layout->opAt(p) == CoordOp::Splat)
-        o.splatDim[p] = dom.numLoopDims++;
+    if (o.layout->splatPhys())
+      o.splatLoop = dom.numLoopDims++;
   }
   return dom;
 }
@@ -746,9 +769,9 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
 /// Mechanical, once the domain has decided the numbering and the order: walk this
 /// operand's physical dims and, per dim, emit the loop dim the domain assigned to
 /// the component that dim carries — the stick, the lane, or this operand's own
-/// splat loop, which a read replaces with the constant 0 — and where the operand
-/// holds whole a dim the domain delinearized, the linearization of that dim's two
-/// components.
+/// splat loop, which a read replaces with the constant 0. refuseLinearization has
+/// already rejected an operand that holds whole a dim the domain delinearized, so
+/// every result is a bare loop dim or a constant.
 AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
                      MLIRContext *ctx) {
   auto loopExpr = [&](int loopDim) { return getAffineDimExpr(loopDim, ctx); };
@@ -780,22 +803,70 @@ AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
     case CoordOp::Splat:
       // A write names the replication axis by the loop the domain allocated for
       // it; a read takes lane 0.
+      assert(p + 1 == numResults && "a splat is the last physical dim");
       results.push_back(o.access == Access::Read
                             ? getAffineConstantExpr(0, ctx)
-                            : loopExpr(o.splatDim[p]));
+                            : loopExpr(o.splatLoop));
       break;
     case CoordOp::Identity:
-      // This operand holds the dim whole. If the domain delinearized it, the two
-      // components must be linearized back here.
-      results.push_back(
-          dom.isSplit(loop)
-              ? linearizeStickLane(loopExpr(dom.stickDim[loop]),
-                                  dom.width[loop], loopExpr(dom.laneDim[loop]))
-              : loopExpr(dom.stickDim[loop]));
+      assert(!dom.isSplit(loop) &&
+             "refuseLinearization admits no operand holding a split dim whole");
+      results.push_back(loopExpr(dom.stickDim[loop]));
       break;
     }
   }
   return AffineMap::get(dom.numLoopDims, /*symbolCount=*/0, results, ctx);
+}
+
+/// Reject every operand that holds whole a logical loop dim `dom` delinearized.
+///
+/// Such an operand has one physical dim where the domain has two loop dims, and
+/// the only map result naming its element from them is the linearization
+/// `stick * W + lane`, which this pass does not emit. One error per offending
+/// operand, naming the first split dim it holds whole, with a note at the
+/// operand's producer.
+///
+/// Run after buildLoopDomain and before anything in the generic is retyped, so a
+/// refused generic is left as it was.
+LogicalResult refuseLinearization(linalg::GenericOp op,
+                                  ArrayRef<RebuildOperand> operands,
+                                  const LoopDomain &dom) {
+  LogicalResult result = success();
+  for (auto [i, o] : llvm::enumerate(operands)) {
+    unsigned numResults =
+        o.layout ? o.layout->physRank() : o.logicalMap.getNumResults();
+    for (unsigned p = 0; p < numResults; ++p) {
+      CoordOp coordOp = o.layout ? o.layout->opAt(p) : CoordOp::Identity;
+      if (coordOp != CoordOp::Identity)
+        continue;
+      int64_t logDim = o.layout ? o.layout->src[p] : p;
+      auto dimExpr = dyn_cast<AffineDimExpr>(o.logicalMap.getResult(logDim));
+      if (!dimExpr || !dom.isSplit(dimExpr.getPosition()))
+        continue;
+      unsigned loop = dimExpr.getPosition();
+      int64_t w = dom.width[loop];
+      InFlightDiagnostic diag =
+          op.emitError("rewrite-descriptor-layout-generic: operand ") << i;
+      if (o.layout)
+        diag << "'s layout carries logical loop dim " << loop << " whole";
+      else
+        diag << " has no layout and reads logical loop dim " << loop
+             << " whole";
+      diag << ", which operand " << dom.splitBy[loop]
+           << " splits into stick and lane at width " << w
+           << "; restating operand " << i
+           << " over that split would need the linearizing map `stick * " << w
+           << " + lane`, which the scheduler cannot take. Give operand " << i
+           << " a layout that splits loop dim " << loop << " at width " << w
+           << " too";
+      if (Operation *def = op->getOperand(i).getDefiningOp())
+        diag.attachNote(def->getLoc())
+            << "operand " << i << " is produced here";
+      result = failure();
+      break;
+    }
+  }
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -809,19 +880,6 @@ AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
 // what covers them is the positive cases, all of them at once.
 //===----------------------------------------------------------------------===//
 
-/// The loop dims `e` names, left to right — a linearized composite reading as
-/// its stick half then its lane half. Constants name none.
-void collectNamedLoopDims(AffineExpr e, SmallVectorImpl<unsigned> &out) {
-  if (auto dim = dyn_cast<AffineDimExpr>(e)) {
-    out.push_back(dim.getPosition());
-    return;
-  }
-  if (auto bin = dyn_cast<AffineBinaryOpExpr>(e)) {
-    collectNamedLoopDims(bin.getLHS(), out);
-    collectNamedLoopDims(bin.getRHS(), out);
-  }
-}
-
 /// (i) Every loop dim of the rebuilt domain is named by at least one operand's
 /// rebuilt map.
 ///
@@ -832,19 +890,15 @@ void collectNamedLoopDims(AffineExpr e, SmallVectorImpl<unsigned> &out) {
 [[maybe_unused]] bool everyLoopDimIsNamed(ArrayRef<AffineMap> maps,
                                           unsigned numLoopDims) {
   llvm::SmallBitVector named(numLoopDims);
-  SmallVector<unsigned> dims;
   for (AffineMap m : maps)
-    for (AffineExpr r : m.getResults()) {
-      dims.clear();
-      collectNamedLoopDims(r, dims);
-      for (unsigned d : dims)
-        named.set(d);
-    }
+    for (AffineExpr r : m.getResults())
+      if (auto dim = dyn_cast<AffineDimExpr>(r))
+        named.set(dim.getPosition());
   return named.all();
 }
 
 /// (ii) The result operand's map names the loop dims in strictly increasing
-/// order, reading each linearized composite left to right.
+/// order. Constants name no loop dim and are skipped.
 ///
 /// The ordering exists for this: the result's coordinate order is the one the
 /// generic does not get to choose, so its map has to take the loop dims in the
@@ -854,7 +908,8 @@ void collectNamedLoopDims(AffineExpr e, SmallVectorImpl<unsigned> &out) {
 [[maybe_unused]] bool resultMapIsMonotone(AffineMap map) {
   SmallVector<unsigned> dims;
   for (AffineExpr r : map.getResults())
-    collectNamedLoopDims(r, dims);
+    if (auto dim = dyn_cast<AffineDimExpr>(r))
+      dims.push_back(dim.getPosition());
   for (unsigned i = 1; i < dims.size(); ++i)
     if (dims[i - 1] >= dims[i])
       return false;
@@ -1120,14 +1175,13 @@ struct RewriteDescriptorLayoutGenericPass
   }
 
   /// Which tile load `ld` from a view under `cm` is rebuilt over: Lane0 when
-  /// `cm` has a splat dim and every use of `ld` is a linalg.generic `ins`
-  /// operand, Stick otherwise. Every generic reading a load from an annotated view is
-  /// rewritten by this pass, and its rebuilt map names each splat dim of an
-  /// `ins` operand at lane 0, so those uses need only that lane.
+  /// `cm`'s last physical dim is a splat and every use of `ld` is a
+  /// linalg.generic `ins` operand, Stick otherwise. Every generic reading a load
+  /// from an annotated view is rewritten by this pass, and its rebuilt map names
+  /// the splat dim of an `ins` operand at lane 0, so those uses need only that
+  /// lane.
   static LoadTile classifyLoad(mlir::ktdp::LoadOp ld, const CoordMap &cm) {
-    bool hasSplat = llvm::any_of(llvm::seq(cm.physRank()), [&](unsigned p) {
-      return cm.opAt(p) == CoordOp::Splat;
-    });
+    bool hasSplat = cm.splatPhys().has_value();
     // A generic `ins` is the only use that broadcasts lane 0 across the stick,
     // through the map this pass rebuilds. A store or an `outs` takes the value
     // as a whole stick, so it needs the full tile.
@@ -1215,15 +1269,13 @@ struct RewriteDescriptorLayoutGenericPass
       return tileOp.emitError("tts.tensor_layout: cannot derive a static "
                               "physical block shape for this access tile");
 
-    for (unsigned p = 0, e = cm.physRank(); p < e; ++p) {
-      if (cm.opAt(p) != CoordOp::Mod)
-        continue;
-      int64_t logExtent = logBlock[cm.src[p]];
-      if (logExtent != ShapedType::kDynamic && logExtent < cm.arg[p])
+    if (auto d = cm.splitDim()) {
+      int64_t logExtent = logBlock[*d];
+      if (logExtent != ShapedType::kDynamic && logExtent < cm.stickWidth())
         return tileOp.emitError(
                    "tts.tensor_layout: block extent of stick dim (")
-               << logExtent << ") is smaller than the stick size (" << cm.arg[p]
-               << "); a stick dim cannot be sub-stick";
+               << logExtent << ") is smaller than the stick size ("
+               << cm.stickWidth() << "); a stick dim cannot be sub-stick";
     }
 
     // Recover one index per logical dim. base_map may have fewer inputs than
@@ -1679,6 +1731,8 @@ struct RewriteDescriptorLayoutGenericPass
                                [&]() { return op.emitError(); });
     if (failed(dom))
       return failure();
+    if (failed(refuseLinearization(op, rebuildOperands, *dom)))
+      return failure();
 
     SmallVector<AffineMap> physMaps;
     for (const RebuildOperand &o : rebuildOperands)
@@ -1705,10 +1759,10 @@ struct RewriteDescriptorLayoutGenericPass
         llvm::dbgs() << "\n";
       }
       for (auto [i, o] : llvm::enumerate(rebuildOperands)) {
-        for (unsigned p = 0, e = o.splatDim.size(); p < e; ++p)
-          if (o.splatDim[p] >= 0)
-            llvm::dbgs() << "      operand " << i << " splat phys dim " << p
-                         << " -> fresh loop d" << o.splatDim[p] << "\n";
+        if (o.splatLoop >= 0)
+          llvm::dbgs() << "      operand " << i << " splat phys dim "
+                       << o.layout->physRank() - 1 << " -> fresh loop d"
+                       << o.splatLoop << "\n";
         llvm::dbgs() << "      operand " << i << " " << o.logicalMap << " -> "
                      << physMaps[i];
         if (!o.layout)
@@ -1891,7 +1945,7 @@ struct RewriteDescriptorLayoutGenericPass
   /// This pass has no stage that widens a store's data, by choice: every case
   /// where a compute op sits between the load and the store is already handled
   /// by the rebuild giving both ends the same domain (see rebuild-composite.mlir
-  /// case 3), and the remaining case is a copy, for which annotating the source
+  /// case 2), and the remaining case is a copy, for which annotating the source
   /// as well costs one marker and needs no new machinery.
   ///
   /// Only this direction is checked. The mirror image — a physicalized data value

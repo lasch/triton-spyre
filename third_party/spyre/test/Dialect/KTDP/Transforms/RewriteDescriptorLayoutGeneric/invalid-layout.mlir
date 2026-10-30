@@ -22,6 +22,16 @@
 // the verifier on parsing, so the diagnostic there comes from readCoordMap,
 // which calls the same shared checker; under the first RUN line the parser's
 // verifier emits it.
+//
+// Cases 7 to 9 are layouts that are each valid and do not fit together. One
+// generic is one loop nest that every operand is read or written from. A layout
+// that sticks a dim, e.g. N as [N/64, M, N%64], turns the loop over N into two:
+// which stick, and which lane in it. An operand of the same generic that holds
+// N as one plain dim then has no loop of its own to be indexed by: its element
+// is at `stick * 64 + lane`, a computed index the scheduler cannot take. So
+// every operand of a generic must stick the same dims at the same width. The
+// pass refuses the generic, once per operand that does not, with a note at its
+// producer.
 
 // Case 1 -- the layout does not fit the block.
 //
@@ -55,12 +65,12 @@ tt.func @block_smaller_than_stick(%ptr: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
 // Case 2 -- two layouts disagree about one loop dim.
 //
 // The rebuilt domain gives a split dim a (stick, elem) pair with ONE width, and an
-// operand holding that dim whole addresses it as `stick * width + elem` -- see
-// rebuild-composite.mlir. The pair can have only one pair of extents, so two
-// widths on one loop dim leave no such composite -- and naming the two candidates
-// shows why neither choice is safe. The third operand, %c, carries no layout and
-// so holds logical dim 1 whole at 128; it is the one that would have to read a
-// composite, and its two candidates are
+// operand holding that dim whole would address it as `stick * width + elem`. The
+// pair can have only one pair of extents, so two widths on one loop dim leave no
+// such composite -- and naming the two candidates shows why neither choice is
+// safe. The third operand, %c, carries no layout and so holds logical dim 1 whole
+// at 128; it is the one that would have to read a composite, and its two
+// candidates are
 //
 //   s * 64 + e   with (s, e) running (0..1, 0..63)
 //   s * 32 + e   with (s, e) running (0..3, 0..31)
@@ -163,7 +173,7 @@ tt.func @named_matmul_declines(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f
 // shape` about an op nobody named.
 //
 // The named pass absorbs this in a widening stage; this one declines instead, and
-// the remedy is one more marker. rebuild-composite.mlir case 3 is the same store
+// the remedy is one more marker. rebuild-composite.mlir case 2 is the same store
 // with a generic in between, which needs no widening because the rebuild gives both
 // ends the same domain -- that contrast is why the decline is narrow.
 
@@ -282,3 +292,145 @@ tt.func @split_width_mismatch(%a: !tt.ptr<f16>) {
   tt.return
 }
 }
+
+// -----
+
+// Case 7 -- `o = a + b`, with a layout on `a` and `o` but none on `b`.
+//
+//   a, o : [M, N] -> [N/64, M, N%64]   N in sticks of 64
+//   b    : [M, N]                      N plain
+//
+// The add walks `a` and `o` stick by stick. To find the matching element of
+// `b` it would have to compute `n = stick * 64 + lane`. In a kernel this is a
+// descriptor that was left unannotated: giving `b` the same layout as `a` fixes
+// it. The whole message is checked here, once; cases 8 and 9 check only the part
+// that identifies them.
+
+#id = affine_map<(d0, d1) -> (d0, d1)>
+#s = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+tt.func @unannotated_operand_reads_split_dim(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %o: !tt.ptr<f16>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f16> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf16>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+  %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf16>
+  %bi = builtin.unrealized_conversion_cast %b : !tt.ptr<f16> to index
+  %bv = ktdp.construct_memory_view %bi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>} : memref<64x128xf16>
+  %bt = ktdp.construct_access_tile %bv[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+  // expected-note @below {{operand 1 is produced here}}
+  %bl = ktdp.load %bt : <64x128xindex> -> tensor<64x128xf16>
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f16> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf16>
+  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+  %e = tensor.empty() : tensor<64x128xf16>
+  // expected-error @below {{rewrite-descriptor-layout-generic: operand 1 has no layout and reads logical loop dim 1 whole, which operand 0 splits into stick and lane at width 64; restating operand 1 over that split would need the linearizing map `stick * 64 + lane`, which the scheduler cannot take. Give operand 1 a layout that splits loop dim 1 at width 64 too}}
+  %r = linalg.generic {indexing_maps = [#id, #id, #id], iterator_types = ["parallel", "parallel"]} ins(%al, %bl : tensor<64x128xf16>, tensor<64x128xf16>) outs(%e : tensor<64x128xf16>) {
+  ^bb0(%x: f16, %y: f16, %z: f16):
+    %s = arith.addf %x, %y : f16
+    linalg.yield %s : f16
+  } -> tensor<64x128xf16>
+  ktdp.store %r, %ot : tensor<64x128xf16>, <64x128xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 8 -- `o = a^T`, each side in sticks along its own last dim.
+//
+//   a : [N, M] -> [M/64, N, M%64]   M in sticks of 64
+//   o : [M, N] -> [N/64, M, N%64]   N in sticks of 64
+//
+// Both are the default layout, and on their own both are fine. Across the
+// transpose they stick different dims: a stick of `a` is 64 consecutive M, a
+// stick of `o` is 64 consecutive N. No stick of one is a stick of the other, so
+// no loop nest addresses both without computing an index, and each operand is
+// refused for the dim the other sticks. Moving data from sticks along one dim to
+// sticks along another is a restickify, not a re-indexed copy.
+
+#in  = affine_map<(d0, d1) -> (d1, d0)>
+#out = affine_map<(d0, d1) -> (d0, d1)>
+#sin  = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+#sout = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#id2 = affine_map<(d0, d1) -> (d0, d1)>
+module {
+tt.func @transpose_different_split_dims(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
+  // Split the input's logical dim 1, which the consumer's map reads as loop d0.
+  %av = ktdp.construct_memory_view %ai, sizes: [128, 64], strides: [64, 1] {coordinate_set = #sin, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<128x64xf32>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sin} : memref<128x64xf32> -> !ktdp.access_tile<128x64xindex>
+  // expected-note @below {{operand 0 is produced here}}
+  %al = ktdp.load %at : <128x64xindex> -> tensor<128x64xf32>
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
+  // Split the output's logical dim 1, which is loop d1.
+  %ov = ktdp.construct_memory_view %oi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #sout, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
+  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sout} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+  // expected-note @below {{operand 1 is produced here}}
+  %e = tensor.empty() : tensor<64x128xf32>
+  // expected-error @below {{operand 0's layout carries logical loop dim 1 whole, which operand 1 splits}}
+  // expected-error @below {{operand 1's layout carries logical loop dim 0 whole, which operand 0 splits}}
+  %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["parallel", "parallel"]} ins(%al : tensor<128x64xf32>) outs(%e : tensor<64x128xf32>) {
+  ^bb0(%x: f32, %y: f32):
+    linalg.yield %x : f32
+  } -> tensor<64x128xf32>
+  ktdp.store %r, %ot : tensor<64x128xf32>, <64x128xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 9 -- `c = a @ b`, with `a` and `b` sticking different dims of `c`.
+//
+//   a : [M, K] -> [M/64, K, M%64]   M in sticks of 64
+//   b : [K, N] -> [N/64, K, N%64]   N in sticks of 64
+//   c : [M, N]                      both plain
+//
+// The loop nest has a stick and a lane loop for M, from `a`, and for N, from
+// `b`. `c` holds both whole, so it is wrong twice. It is reported once, for the
+// first of them: one error per operand, not per dim.
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#map1 = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map2 = affine_map<(d0, d1, d2) -> (d2, d1)>
+#map3 = affine_map<(d0, d1, d2) -> (d0, d1)>
+#seta = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#setb = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+#setc = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+module {
+  tt.func @matmul_both_parallel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: !tt.ptr<f32>) {
+    %c0 = arith.constant 0 : index
+    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #seta, memory_space = #ktdp.memory_space<global>,
+        tts.tensor_layout = {phys_src = array<i64: 0, 1, 0>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
+    %2 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map, access_tile_set = #seta} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+    %3 = ktdp.load %2 : <64x128xindex> -> tensor<64x128xf32>
+    %4 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
+    %5 = ktdp.construct_memory_view %4, sizes: [128, 64], strides: [64, 1] {coordinate_set = #setb, memory_space = #ktdp.memory_space<global>,
+        tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<128x64xf32>
+    %6 = ktdp.construct_access_tile %5[%c0, %c0] {access_tile_order = #map, access_tile_set = #setb} : memref<128x64xf32> -> !ktdp.access_tile<128x64xindex>
+    %7 = ktdp.load %6 : <128x64xindex> -> tensor<128x64xf32>
+    %8 = builtin.unrealized_conversion_cast %arg2 : !tt.ptr<f32> to index
+    %9 = ktdp.construct_memory_view %8, sizes: [64, 64], strides: [64, 1] {coordinate_set = #setc, memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
+    %10 = ktdp.construct_access_tile %9[%c0, %c0] {access_tile_order = #map, access_tile_set = #setc} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
+    // expected-note @below {{operand 2 is produced here}}
+    %11 = ktdp.load %10 : <64x64xindex> -> tensor<64x64xf32>
+    // expected-error @below {{operand 2 has no layout and reads logical loop dim 0 whole, which operand 0 splits}}
+    %12 = linalg.generic {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "reduction"]} ins(%3, %7 : tensor<64x128xf32>, tensor<128x64xf32>) outs(%11 : tensor<64x64xf32>) {
+    ^bb0(%in: f32, %in_0: f32, %out: f32):
+      %14 = arith.mulf %in, %in_0 : f32
+      %15 = arith.addf %out, %14 : f32
+      linalg.yield %15 : f32
+    } -> tensor<64x64xf32>
+    %13 = ktdp.construct_access_tile %9[%c0, %c0] {access_tile_order = #map, access_tile_set = #setc} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
+    ktdp.store %12, %13 : tensor<64x64xf32>, <64x64xindex>
+    tt.return
+  }
+}
+
