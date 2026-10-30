@@ -1657,18 +1657,23 @@ VARIANTS = {
             "K_INDICES":  [32],
             "BLOCK_COLS": [256],
             "y_offset":   [0],
-            # Both layouts are stick-on-N with the gathered dim kept outermost.
-            # dataflow-scheduler's IndirectAddrBufLegalization pins the first
-            # non-unit dim of the gather's output access tile, so the indirect
-            # dim has to lead out_ptr; with the stick dim leading instead, it
-            # pins that and fails expand_shape verification. in_ptr follows
-            # the same order, since RewriteDescriptorLayoutGeneric carries the
-            # gathered data in in_ptr's dim order and cannot permute it to
-            # match a differently ordered store.
-            # in_ptr [M, N] -> [M, N//_SS1, _SS1]
-            "IN_LAYOUT":  [[0, (1, "floordiv", _SS1("in_ptr")), (1, "mod", _SS1("in_ptr"))]],
-            # out_ptr [K_INDICES, BLOCK_COLS] -> [K_INDICES, BLOCK_COLS//_SS1, _SS1]
-            "OUT_LAYOUT": [[0, (1, "floordiv", _SS1("out_ptr")), (1, "mod", _SS1("out_ptr"))]],
+            # Both layouts are stick-on-N with the stick-count (floordiv) dim
+            # outermost and the row dim second, the order torch-spyre gives a
+            # 2-D tensor staged with .to("spyre"): a kernel reading or writing
+            # such a tensor has to describe it this way. The gathered dim is
+            # therefore the second dim of the output access tile.
+            # dataflow-scheduler's IndirectAddrBufLegalization currently pins
+            # the first non-unit dim of that tile, which is the stick-count
+            # dim, and fails expand_shape verification; that is why this
+            # variant does not compile to a binary yet (see below). in_ptr
+            # follows the same order as out_ptr, since
+            # RewriteDescriptorLayoutGeneric carries the gathered data in
+            # in_ptr's dim order and cannot permute it to match a differently
+            # ordered store.
+            # in_ptr [M, N] -> [N//_SS1, M, _SS1]
+            "IN_LAYOUT":  [[(1, "floordiv", _SS1("in_ptr")), 0, (1, "mod", _SS1("in_ptr"))]],
+            # out_ptr [K_INDICES, BLOCK_COLS] -> [BLOCK_COLS//_SS1, K_INDICES, _SS1]
+            "OUT_LAYOUT": [[(1, "floordiv", _SS1("out_ptr")), 0, (1, "mod", _SS1("out_ptr"))]],
         },
         "tags":       ["descriptor-gather", "spyre-tensor-layout"],
         # No tl.program_id, so DistributeWork has nothing to place and the
@@ -1680,9 +1685,7 @@ VARIANTS = {
         "output_key": "out_ptr",
         "rtol":       1e-2,
         "atol":       5e-2,
-        # Temporarily False until downstream fixes are in place: the variant
-        # compiles to a binary, but on the device the program either never
-        # completes or returns wrong rows.
+        # Temporarily False until downstream fixes are in place:
         "compiles_to_binary": False,
     },
     # -----------------------------------------------------------------------
